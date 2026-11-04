@@ -1,0 +1,510 @@
+# 【技术审查任务书】Telegram 群组多账号关键词监控系统（工业级高可用与 AI 意图分流架构）
+
+> **致审查方（ChatGPT / Claude / GML 架构师团队）：**  
+> 请对以下由 AI-OPC 架构团队设计的《Telegram 群组关键词监控系统》工程方案及核心实现代码进行严格的 **Peer Review（同行评审与深度审查）**。重点核验系统的并发安全性、MTProto 协议风控边界、消息去重稳定性、网络异常容灾以及与 OpenAI 协议兼容的大模型评估管道。
+
+---
+
+## 一、审查提示词与审查关注点 (Review Prompt)
+
+请以 **Telegram MTProto 协议专家、分布式爬虫架构师及高并发 Python 异步系统工程师** 的视角，对本方案进行深度审查，并重点回答以下 5 个维度的核验问题：
+
+1. **【异步事件循环与死锁风险】**：
+   - Telethon 多个 Client（1 个通知 Bot + N 个 Userbot 监听客户端）运行在同一个 `asyncio` 事件循环中，在持续接收大量消息高并发触发时，是否存在事件阻塞或上下文竞争风险？
+2. **【协议风控与异常熔断机制】**：
+   - 监听端（Userbot）在遭遇 Telegram 官方踢下线、Session 失效（`AuthKeyUnregisteredError`）或封号（`UserDeactivatedBanError`）时，当前实现的熔断摘除与通知逻辑是否健壮？是否存在无限重试导致进程僵死的风险？
+   - 历史消息拉取（`fetch_user_history`）与发信推送时，对 `FloodWaitError` 的处理是否完备？
+3. **【消息去重与内存生命周期】**：
+   - 基于内存哈希字典（`PROCESSED_MSG_HASHES`）与发送者冷却字典（`USER_COOLDOWN`）实现的防重防刷机制，在监控数百个活跃大群的极端大流量场景下，是否存在内存泄漏隐患？清理策略是否足够工业级？
+4. **【交互按钮与持久化闭环】**：
+   - Bot 内联按钮（`CallbackQuery`）的一键拉黑用户、屏蔽群组直接落盘修改 `config.json`，在并发触发时是否存在文件读写锁冲突（Race Condition）？
+5. **【AI 评估容错与性能降级】**：
+   - 接入兼容 OpenAI 协议的 `agens` 免费大模型进行 0~100 分意图与广告打分时，设置的 3.5 秒超时熔断与兜底策略是否合理？能否确保 AI 接口宕机时不影响核心监听链路？
+
+---
+
+## 二、系统架构设计与业务拓扑
+
+### 1. 物理环境与技术边界
+- **宿主环境**：本地飞牛 NAS（Docker 容器化部署常驻），通过容器网络挂载局域网 SOCKS5 代理打通 Telegram MTProto 长连接。
+- **业务边界**：完全独立的单体监控系统，彻底物理隔离，不与任何外部客服系统或外部数据库产生依赖。
+
+### 2. 双端低风控 + 多账号池化热备机制
+```text
+                  [ 外部被监控公开/私密群组 (≤500个) ]
+                                    │
+                                    ▼ (MTProto 长连接只读流)
+              ┌─────────────────────┴─────────────────────┐
+              ▼                                           ▼
+   【监听端：小号 1 (活跃主号)】               【监听端：小号 2 (热备冗余)】
+   (Telethon Session 1 只读读流)               (Telethon Session 2 只读读流)
+              │                                           │
+         [异常/Ban熔断]                               [异常/Ban熔断]
+              │                                           │
+              └─────────────────────┬─────────────────────┘
+                                    ▼
+                         【内存过滤与规则路由引擎】
+                   ├── 1. 消息指纹全局去重 (MD5 60秒防抖)
+                   ├── 2. 黑白名单拦截 (黑名单群 / 屏蔽无用户名号)
+                   ├── 3. 业务基础词 + 城市规则多路路由匹配
+                   ├── 4. 频控冷却池 (同人 300 秒抑制防刷)
+                   ├── 5. 异步拉取发信人该群历史 3 条发言 (构建上下文)
+                   └── 6. 调用 agens 大模型做 0-100 分广告意图识别打分
+                                    │
+                                    ▼ (组装 Markdown 8 键结构化卡片)
+                          【官方通知端 (Bot API)】
+                                    │
+                   ┌────────────────┴────────────────┐
+                   ▼                                 ▼
+         【专属目标管理群 A (如广州)】       【专属目标管理群 B (如深圳)】
+        [💬聊天] [📜历史] [🗑删除]          [💬聊天] [📜历史] [🗑删除]
+        [⛔封人] [🚫封群] [屏蔽词]          [⛔封人] [🚫封群] [屏蔽词]
+```
+
+---
+
+## 三、工程配置文件规格 (`config.json`)
+
+```json
+{
+  "bot_token": "1234567890:ABCdefGHIjklMNOpqrSTUvwxyz",
+  "proxy": {
+    "enabled": true,
+    "addr": "192.168.1.100",
+    "port": 5002
+  },
+  "accounts": [
+    {
+      "account_id": "user_01",
+      "api_id": 111111,
+      "api_hash": "hash_01_here",
+      "enabled": true
+    },
+    {
+      "account_id": "user_02",
+      "api_id": 222222,
+      "api_hash": "hash_02_here",
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "name": "广州组",
+      "target_group_id": -1001111111111,
+      "keywords": ["广州", "白云", "天河", "番禺", "海珠", "越秀"]
+    },
+    {
+      "name": "深圳组",
+      "target_group_id": -1002222222222,
+      "keywords": ["深圳", "南山", "福田", "罗湖", "宝安", "龙华"]
+    }
+  ],
+  "default_target_group_id": -1009999999999,
+  "common_business_keywords": ["SPA", "按摩", "水会", "预约", "推荐", "品茶"],
+  "exclude_keywords": ["招聘", "求职", "招租", "转让"],
+  "ignore_no_username": false,
+  "cooldown_seconds": 300,
+  "blacklist_users": [],
+  "blacklist_chats": [],
+  "agens_ai": {
+    "enabled": true,
+    "api_base": "https://api.agens.ai/v1",
+    "api_key": "YOUR_AGENS_API_KEY",
+    "model": "agens",
+    "min_score_threshold": 0
+  }
+}
+```
+
+---
+
+## 四、核心生产代码实现 (`main.py`)
+
+```python
+import os
+import re
+import json
+import time
+import hashlib
+import asyncio
+import logging
+from datetime import datetime
+import aiohttp
+import socks
+from telethon import TelegramClient, events
+from telethon.tl.custom import Button
+from telethon.errors import (
+    FloodWaitError,
+    AuthKeyUnregisteredError,
+    UserDeactivatedBanError
+)
+
+# 日志输出配置
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+)
+logger = logging.getLogger("tg-monitor")
+
+CONFIG_PATH = os.getenv("CONFIG_PATH", "config.json")
+DATA_DIR = os.getenv("DATA_DIR", "./data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# 线程/协程安全文件配置锁
+CONFIG_LOCK = asyncio.Lock()
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+# 内存状态池
+PROCESSED_MSG_HASHES = {}  # {msg_hash: timestamp} 60秒防抖指纹
+USER_COOLDOWN = {}          # {sender_id: timestamp} 频控冷却池
+ZERO_WIDTH_CHARS = re.compile(r"[\u200b-\u200f\ufeff\u202a-\u202e]")
+SPECIAL_SYMBOLS = re.compile(r"[\s\*\#\_\-\|\~\`\.\,\!\?，。！？👇👉]+")
+
+proxy_setting = None
+if config.get("proxy", {}).get("enabled"):
+    proxy_setting = (
+        socks.SOCKS5,
+        config["proxy"]["addr"],
+        int(config["proxy"]["port"])
+    )
+    logger.info(f"已启用本地 SOCKS5 代理: {config['proxy']['addr']}:{config['proxy']['port']}")
+
+# 初始化官方通知 Bot 客户端
+bot_client = TelegramClient(
+    os.path.join(DATA_DIR, "bot_session"),
+    api_id=config["accounts"][0]["api_id"],
+    api_hash=config["accounts"][0]["api_hash"],
+    proxy=proxy_setting
+)
+
+def clean_text(raw: str) -> str:
+    """文本归一化：剔除零宽字符与标点干扰"""
+    text = ZERO_WIDTH_CHARS.sub("", raw)
+    text = SPECIAL_SYMBOLS.sub("", text)
+    return text.lower()
+
+def is_duplicate(raw_text: str, sender_id: int) -> bool:
+    """双活账号消息全局去重（60秒滑动窗口）"""
+    now = time.time()
+    expired = [h for h, t in PROCESSED_MSG_HASHES.items() if now - t > 60]
+    for h in expired:
+        del PROCESSED_MSG_HASHES[h]
+
+    msg_sig = f"{sender_id}:{clean_text(raw_text)}"
+    msg_hash = hashlib.md5(msg_sig.encode("utf-8")).hexdigest()
+    if msg_hash in PROCESSED_MSG_HASHES:
+        return True
+    PROCESSED_MSG_HASHES[msg_hash] = now
+    return False
+
+def is_throttled(sender_id: int) -> bool:
+    """同用户频控冷却检测（默认 300 秒）"""
+    cooldown = config.get("cooldown_seconds", 300)
+    now = time.time()
+    
+    # 定期清理 24 小时未活跃的冷却记录防止无限增长
+    if len(USER_COOLDOWN) > 5000:
+        expired = [uid for uid, t in USER_COOLDOWN.items() if now - t > 86400]
+        for uid in expired:
+            del USER_COOLDOWN[uid]
+
+    last = USER_COOLDOWN.get(sender_id, 0)
+    if now - last < cooldown:
+        return True
+    USER_COOLDOWN[sender_id] = now
+    return False
+
+def resolve_target_routes(text: str) -> tuple[bool, list[int], list[str]]:
+    """业务规则匹配与多城市路由解析引擎"""
+    text_lower = text.lower()
+    text_cleaned = clean_text(text)
+
+    # 1. 排除词优先拦截 (NOT 规则)
+    for exc in config.get("exclude_keywords", []):
+        if exc.lower() in text_lower or clean_text(exc) in text_cleaned:
+            return False, [], []
+
+    # 2. 行业通用基础词匹配 (OR 关系)
+    business_kws = config.get("common_business_keywords", [])
+    hit_business = [kw for kw in business_kws if kw.lower() in text_lower or clean_text(kw) in text_cleaned]
+    if not hit_business:
+        return False, [], []
+
+    target_groups = set()
+    hit_city_kws = []
+
+    # 3. 城市定向路由规则匹配
+    for route in config.get("routes", []):
+        for kw in route.get("keywords", []):
+            if kw.lower() in text_lower or clean_text(kw) in text_cleaned:
+                target_groups.add(route["target_group_id"])
+                hit_city_kws.append(kw)
+                break
+
+    # 若命中业务词但未限定城市，推送到默认兜底总管理群
+    if not target_groups and config.get("default_target_group_id"):
+        target_groups.add(config["default_target_group_id"])
+
+    all_matched = list(set(hit_business + hit_city_kws))
+    return bool(target_groups), list(target_groups), all_matched
+
+async def evaluate_by_agens_ai(current_text: str, history_context: list[str]) -> dict:
+    """调用 agens 模型进行 0-100 分广告意图识别打分"""
+    ai_cfg = config.get("agens_ai", {})
+    if not ai_cfg.get("enabled"):
+        return {"score": 30, "reason": "未启用AI打分", "is_ad": False}
+
+    context_str = " | ".join(history_context) if history_context else "无历史发言"
+    system_prompt = (
+        "你是一个Telegram商机与广告过滤器。请根据用户发言与上下文判定：\n"
+        "1. score: 广告嫌疑度(0-100分，分越低越像找店潜客，分越高越像同行批量发广告)。\n"
+        "2. is_ad: 布尔值。\n"
+        "3. reason: 10字内判据。\n"
+        "严格返回标准JSON: {\"score\": 25, \"is_ad\": false, \"reason\": \"潜客询问价格\"}"
+    )
+    payload = {
+        "model": ai_cfg.get("model", "agens"),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"历史发言: {context_str}\n当前发言: {current_text}"}
+        ],
+        "temperature": 0.1
+    }
+    url = f"{ai_cfg.get('api_base')}/chat/completions"
+    headers = {"Authorization": f"Bearer {ai_cfg.get('api_key')}"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=3.5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    content = content.replace("```json", "").replace("```", "").strip()
+                    return json.loads(content)
+    except Exception as e:
+        logger.warning(f"[agens AI评估超时或故障] 自动降级: {e}")
+    return {"score": 35, "reason": "AI超时降级", "is_ad": False}
+
+async def fetch_user_history(client: TelegramClient, chat_id: int, sender_id: int, limit: int = 3) -> list[str]:
+    """拉取该用户在该群的历史发言构建上下文"""
+    history = []
+    try:
+        async for msg in client.iter_messages(chat_id, from_user=sender_id, limit=limit):
+            if msg.raw_text:
+                clean_msg = msg.raw_text.replace("\n", " ").strip()
+                history.append(clean_msg[:30])
+    except FloodWaitError as e:
+        logger.warning(f"拉取历史消息触发 FloodWait，需休眠 {e.seconds} 秒")
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        logger.debug(f"拉取历史上下文忽略: {e}")
+    return history
+
+def build_card_and_buttons(event, matched_kws, chat, sender, history, ai_eval, clean_chat_id):
+    """组装财神风格 Markdown 卡片与 8 键内联交互矩阵"""
+    sender_name = getattr(sender, "first_name", "") or "未知"
+    username = f"@{sender.username}" if getattr(sender, "username", None) else "无用户名"
+    group_title = getattr(chat, "title", "未知群组")
+    capture_time = datetime.now().strftime("%m-%d %H:%M:%S")
+
+    # 原消息跳转链接解析
+    if getattr(chat, "username", None):
+        msg_link = f"https://t.me/{chat.username}/{event.id}"
+    else:
+        msg_link = f"https://t.me/c/{clean_chat_id}/{event.id}"
+
+    history_str = " | ".join(history) if history else "暂无历史上下文"
+
+    card_text = (
+        f"🛡 **商机情报监控中心**\n"
+        f"👤 **用户**: {sender_name} ({username} | `{event.sender_id}`)\n"
+        f"🏢 **来源**: {group_title}\n"
+        f"💬 **内容**: {event.raw_text}\n"
+        f"🤖 **AI广告评分**: {ai_eval.get('score', 30)}分 ({ai_eval.get('reason', '无')})\n"
+        f"🏷 **命中词**: `{' / '.join(matched_kws)}`\n"
+        f"⏰ **时间**: {capture_time}\n"
+        f"────────────────────\n"
+        f"📜 **历史发言**: {history_str}"
+    )
+
+    chat_url = f"https://t.me/{sender.username}" if getattr(sender, "username", None) else msg_link
+    first_kw = matched_kws[0] if matched_kws else "该词"
+    buttons = [
+        [
+            Button.url("💬 聊天", chat_url),
+            Button.inline("📜 历史", data=f"hist:{event.sender_id}"),
+            Button.inline("🗑 删除", data="del:this"),
+            Button.inline("⛔ 封人", data=f"ban_u:{event.sender_id}"),
+            Button.inline("🚫 封群", data=f"ban_c:{event.chat_id}")
+        ],
+        [
+            Button.inline(f"屏蔽:{first_kw[:6]}", data=f"ign_kw:{first_kw}"),
+            Button.inline("✍️ 手动代发", data=f"agent_fwd:{event.id}"),
+            Button.inline("🏷 标记", data=f"tag:{event.id}")
+        ]
+    ]
+    return card_text, buttons
+
+async def handle_incoming_message(client: TelegramClient, event):
+    """核心消息管道"""
+    if not event.is_group:
+        return
+
+    # 防死锁回环：忽略所有已知推送目标群
+    known_target_ids = [r["target_group_id"] for r in config.get("routes", [])]
+    if config.get("default_target_group_id"):
+        known_target_ids.append(config["default_target_group_id"])
+    if event.chat_id in known_target_ids:
+        return
+
+    # 屏蔽群过滤
+    if event.chat_id in config.get("blacklist_chats", []):
+        return
+
+    sender_id = event.sender_id
+    if not sender_id or sender_id in config.get("blacklist_users", []):
+        return
+
+    raw_text = event.raw_text or ""
+    if not raw_text.strip():
+        return
+
+    # 双活去重
+    if is_duplicate(raw_text, sender_id):
+        return
+
+    sender = await event.get_sender()
+    # 无用户名过滤
+    if config.get("ignore_no_username", False) and not getattr(sender, "username", None):
+        return
+
+    # 规则与路由匹配
+    passed, target_group_ids, matched_kws = resolve_target_routes(raw_text)
+    if not passed:
+        return
+
+    # 频控冷却检查
+    if is_throttled(sender_id):
+        return
+
+    chat = await event.get_chat()
+    clean_chat_id = str(event.chat_id).replace("-100", "")
+
+    # 异步并发执行历史拉取与 AI 意图判定
+    history_task = fetch_user_history(client, event.chat_id, sender_id, limit=3)
+    history = await history_task
+    ai_eval = await evaluate_by_agens_ai(raw_text, history)
+
+    card_text, buttons = build_card_and_buttons(
+        event, matched_kws, chat, sender, history, ai_eval, clean_chat_id
+    )
+
+    # 依据路由表推送到对应城市管理群
+    for gid in target_group_ids:
+        try:
+            await bot_client.send_message(gid, card_text, buttons=buttons, link_preview=False)
+            logger.info(f"[推送成功] 目标群: {gid} | 用户: {sender_id} | 命中词: {matched_kws}")
+        except FloodWaitError as e:
+            logger.warning(f"触发发信频控，强制等待 {e.seconds} 秒")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logger.error(f"[推送失败] 目标群: {gid} | 错误: {e}")
+
+# 通知 Bot 回调事件处理器
+@bot_client.on(events.CallbackQuery)
+async def bot_callback_handler(event):
+    data = event.data.decode("utf-8")
+    if data == "del:this":
+        await event.delete()
+    elif data.startswith("ban_u:"):
+        uid = int(data.split(":")[1])
+        async with CONFIG_LOCK:
+            if uid not in config.setdefault("blacklist_users", []):
+                config["blacklist_users"].append(uid)
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+                await event.answer(f"已拉黑用户 {uid}，后续消息自动静默丢弃", alert=True)
+            else:
+                await event.answer("该用户已在黑名单中")
+    elif data.startswith("ban_c:"):
+        cid = int(data.split(":")[1])
+        async with CONFIG_LOCK:
+            if cid not in config.setdefault("blacklist_chats", []):
+                config["blacklist_chats"].append(cid)
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
+                await event.answer(f"已屏蔽群组 {cid}", alert=True)
+            else:
+                await event.answer("该群已在屏蔽列表中")
+    elif data.startswith("hist:"):
+        await event.answer("历史发言已在卡片正文完整渲染", alert=False)
+    else:
+        await event.answer("快捷指令已接收", alert=False)
+
+# 监听客户端生命周期守护线程
+async def run_user_account(account_cfg: dict):
+    acc_id = account_cfg["account_id"]
+    session_file = os.path.join(DATA_DIR, f"{acc_id}.session")
+    client = TelegramClient(
+        session_file,
+        account_cfg["api_id"],
+        account_cfg["api_hash"],
+        proxy=proxy_setting
+    )
+
+    @client.on(events.NewMessage)
+    async def _watcher(evt):
+        await handle_incoming_message(client, evt)
+
+    while True:
+        try:
+            logger.info(f"[{acc_id}] 启动客户端建立 MTProto 长连接...")
+            await client.start()
+            logger.info(f"[{acc_id}] 连接成功，进入静默读流状态...")
+            await client.run_until_disconnected()
+        except (AuthKeyUnregisteredError, UserDeactivatedBanError) as e:
+            logger.critical(f"⚠️ [{acc_id}] 账号失效或被封禁: {e}")
+            if config.get("default_target_group_id"):
+                try:
+                    await bot_client.send_message(
+                        config["default_target_group_id"],
+                        f"🚨 **【监控小号离线预警】**\n账号 `{acc_id}` 已失效或被官方限制！\n错误: `{e}`\n系统已摘除该账号，其余备用号维持监听。"
+                    )
+                except Exception:
+                    pass
+            break  # 摘除该实例，跳出循环
+        except Exception as e:
+            logger.error(f"[{acc_id}] 连接异常断开: {e}，5秒后重试连接...")
+            await asyncio.sleep(5)
+
+# 系统启动主入口
+async def main():
+    logger.info("启动通知 Bot 客户端...")
+    await bot_client.start(bot_token=config["bot_token"])
+
+    tasks = []
+    for acc in config.get("accounts", []):
+        if acc.get("enabled", True):
+            tasks.append(asyncio.create_task(run_user_account(acc)))
+
+    if not tasks:
+        logger.error("无可用监控账号，请检查 config.json 中的 accounts 节点！")
+        return
+
+    logger.info(">>> Telegram 监控系统全量就绪，开始执行多账号热备监听！")
+    await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+## 五、审查结论交付格式要求
+
+请审查专家按照以下结构输出审查意见：
+1. **【总体评级】**：[建议投产 / 需小幅修改 / 存在架构缺陷拒绝投产]
+2. **【逐项核验反馈】**：针对上述 5 项关注点的逐项技术诊断。
+3. **【潜在缺陷与 Patch】**：如有潜在并发、锁竞争、内存问题，请附上针对 `main.py` 的具体代码优化 Patch。
